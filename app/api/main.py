@@ -9,7 +9,7 @@ from app.services.openai_service import OpenAIService
 from app.services.snmp_service import SNMPService
 from app.services.mib_service import MIBService
 from app.models.query import SNMPQuery, SNMPResponse
-from app.utils.cache import get_cache, set_cache, clear_cache
+from app.utils.cache import get_cache, set_cache, clear_cache, get_cache_stats
 
 # Initialize application
 app = FastAPI(
@@ -168,3 +168,21 @@ async def clear_application_cache(prefix: Optional[str] = Query(None, descriptio
     except Exception as e:
         logger.error(f"Error clearing cache: {e}")
         raise HTTPException(status_code=500, detail=f"Error clearing cache: {str(e)}")
+
+
+@app.get("/cache/stats")
+async def get_cache_statistics():
+    """
+    Get cache statistics
+    """
+    try:
+        stats = get_cache_stats()
+        return {
+            "status": "success",
+            "cache_enabled": config.cache_enabled,
+            "cache_ttl": config.cache_ttl,
+            "stats": stats
+        }
+    except Exception as e:
+        logger.error(f"Error getting cache statistics: {e}")
+        raise HTTPException(status_code=500, detail=f"Error getting cache statistics: {str(e)}")

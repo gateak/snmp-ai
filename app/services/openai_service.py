@@ -1,6 +1,10 @@
 import json
+import time
+import asyncio
 from typing import Dict, Any, Optional
 from openai import OpenAI
+from openai.types.chat import ChatCompletion
+from openai import APIError, RateLimitError, APIConnectionError, OpenAIError
 from loguru import logger
 
 from app.core.config import config
@@ -13,6 +17,8 @@ class OpenAIService:
         self.temperature = config.openai.temperature
         self.max_tokens = config.openai.max_tokens
         self.system_prompt = config.openai.system_prompt
+        self.max_retries = 3
+        self.retry_base_delay = 1  # seconds
 
     async def process_query(self, query: str) -> Optional[SNMPQuery]:
         """
@@ -33,14 +39,15 @@ class OpenAIService:
                 {"role": "user", "content": f"Convert this SNMP query to a JSON structure: '{query}'"}
             ]
 
-            # Call the OpenAI API
-            response = self.client.chat.completions.create(
-                model=self.model,
+            # Call the OpenAI API with retry logic
+            response = await self._call_openai_with_retry(
                 messages=messages,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
                 response_format={"type": "json_object"}
             )
+
+            if not response:
+                logger.error("Failed to get a response from OpenAI API after retries")
+                return None
 
             # Extract the JSON response
             response_text = response.choices[0].message.content
@@ -109,13 +116,16 @@ class OpenAIService:
                 {"role": "user", "content": f"Original query: '{original_query}'\nSNMP response: {json.dumps(snmp_response)}\n\nProvide a concise summary of this SNMP data."}
             ]
 
-            # Call the OpenAI API
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens
-            )
+            # Call the OpenAI API with retry logic
+            response = await self._call_openai_with_retry(messages=messages)
+
+            if not response:
+                logger.error("Failed to get a summary response from OpenAI API after retries")
+                return SNMPResponse(
+                    raw_data=snmp_response,
+                    summary="Unable to generate summary due to API error.",
+                    query=original_query
+                )
 
             # Extract the response
             summary = response.choices[0].message.content
@@ -130,6 +140,85 @@ class OpenAIService:
             logger.error(f"Error formatting response with OpenAI: {e}")
             return SNMPResponse(
                 raw_data=snmp_response,
-                summary="Unable to generate summary.",
+                summary="Unable to generate summary due to an unexpected error.",
                 query=original_query
             )
+
+    async def _call_openai_with_retry(self, messages: list, response_format=None) -> Optional[ChatCompletion]:
+        """
+        Call OpenAI API with exponential backoff retry logic
+
+        Args:
+            messages: The messages to send to the API
+            response_format: Optional format specification for the response
+
+        Returns:
+            ChatCompletion response object or None if all retries fail
+        """
+        retry_count = 0
+
+        while retry_count <= self.max_retries:
+            try:
+                # Build kwargs based on whether response_format is provided
+                kwargs = {
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": self.temperature,
+                    "max_tokens": self.max_tokens
+                }
+
+                if response_format:
+                    kwargs["response_format"] = response_format
+
+                # Call the OpenAI API - this is synchronous in the new OpenAI Python client
+                return self.client.chat.completions.create(**kwargs)
+
+            except RateLimitError as e:
+                retry_count += 1
+                if retry_count > self.max_retries:
+                    logger.error(f"Rate limit exceeded, max retries reached: {e}")
+                    return None
+
+                # Calculate backoff delay with jitter
+                delay = self.retry_base_delay * (2 ** (retry_count - 1)) + (time.time() % 1)
+                logger.warning(f"Rate limit exceeded, retrying in {delay:.2f} seconds (attempt {retry_count}/{self.max_retries})")
+                # Use asyncio.sleep for async waiting
+                await asyncio.sleep(delay)
+
+            except APIConnectionError as e:
+                retry_count += 1
+                if retry_count > self.max_retries:
+                    logger.error(f"API connection error, max retries reached: {e}")
+                    return None
+
+                delay = self.retry_base_delay * retry_count
+                logger.warning(f"API connection error, retrying in {delay} seconds (attempt {retry_count}/{self.max_retries})")
+                await asyncio.sleep(delay)
+
+            except APIError as e:
+                # Only retry on 5xx errors
+                if e.status_code and 500 <= e.status_code < 600:
+                    retry_count += 1
+                    if retry_count > self.max_retries:
+                        logger.error(f"Server error {e.status_code}, max retries reached: {e}")
+                        return None
+
+                    delay = self.retry_base_delay * retry_count
+                    logger.warning(f"Server error {e.status_code}, retrying in {delay} seconds (attempt {retry_count}/{self.max_retries})")
+                    await asyncio.sleep(delay)
+                else:
+                    # Don't retry on 4xx errors
+                    logger.error(f"API error: {e}")
+                    return None
+
+            except OpenAIError as e:
+                # General OpenAI error, don't retry
+                logger.error(f"OpenAI API error: {e}")
+                return None
+
+            except Exception as e:
+                # Unexpected error, don't retry
+                logger.error(f"Unexpected error calling OpenAI API: {e}")
+                return None
+
+        return None  # All retries failed

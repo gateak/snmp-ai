@@ -2,7 +2,7 @@ import asyncio
 from typing import Dict, Any, List, Optional, Tuple
 from loguru import logger
 from puresnmp import Client, V1, V2C, ObjectIdentifier
-from puresnmp.exc import SnmpError
+from puresnmp.exc import SnmpError, Timeout
 
 from app.models.query import SNMPQuery, SNMPTarget, SNMPCredentials, SNMPOperation
 from app.core.config import config
@@ -35,45 +35,59 @@ class SNMPService:
             community = query.credentials.community or config.snmp.default_community
 
             # Create SNMP client with proper credentials
-            if query.credentials.version == "1":
-                client = Client(
-                    query.target.host,
-                    V1(community),
-                    port=query.target.port
-                )
-            elif query.credentials.version == "2c":
-                client = Client(
-                    query.target.host,
-                    V2C(community),
-                    port=query.target.port
-                )
-            else:
-                return {"error": "Only SNMP versions 1 and 2c are currently supported"}
+            try:
+                if query.credentials.version == "1":
+                    client = Client(
+                        query.target.host,
+                        V1(community),
+                        port=query.target.port
+                    )
+                elif query.credentials.version == "2c":
+                    client = Client(
+                        query.target.host,
+                        V2C(community),
+                        port=query.target.port
+                    )
+                else:
+                    return {"error": "Only SNMP versions 1 and 2c are currently supported"}
+            except Exception as e:
+                logger.error(f"Failed to create SNMP client: {str(e)}")
+                return {"error": f"Failed to create SNMP client: {str(e)}"}
 
             # Execute SNMP command
-            if query.operation.command.upper() == "GET":
-                result = await self._execute_get(client, oids)
-            elif query.operation.command.upper() == "GETNEXT":
-                result = await self._execute_getnext(client, oids)
-            elif query.operation.command.upper() == "WALK":
-                result = await self._execute_walk(client, oids)
-            elif query.operation.command.upper() == "BULK":
-                result = await self._execute_bulk(
-                    client, oids,
-                    non_repeaters=query.operation.non_repeaters or 0,
-                    max_repetitions=query.operation.max_repetitions or 10
-                )
-            else:
-                return {"error": f"Unsupported SNMP command: {query.operation.command}"}
+            try:
+                if query.operation.command.upper() == "GET":
+                    result = await self._execute_get(client, oids)
+                elif query.operation.command.upper() == "GETNEXT":
+                    result = await self._execute_getnext(client, oids)
+                elif query.operation.command.upper() == "WALK":
+                    result = await self._execute_walk(client, oids)
+                elif query.operation.command.upper() == "BULK":
+                    result = await self._execute_bulk(
+                        client, oids,
+                        non_repeaters=query.operation.non_repeaters or 0,
+                        max_repetitions=query.operation.max_repetitions or 10
+                    )
+                else:
+                    return {"error": f"Unsupported SNMP command: {query.operation.command}"}
+            except Timeout as e:
+                logger.error(f"SNMP timeout while querying {query.target.host}: {str(e)}")
+                return {"error": f"SNMP request timed out. The puresnmp library uses a default timeout."}
+            except ConnectionRefusedError as e:
+                logger.error(f"Connection refused to {query.target.host}: {str(e)}")
+                return {"error": "Connection refused. Verify the device is reachable and SNMP is enabled"}
+            except SnmpError as e:
+                logger.error(f"SNMP error while querying {query.target.host}: {str(e)}")
+                return {"error": f"SNMP error: {str(e)}"}
+            except Exception as e:
+                logger.error(f"Unexpected error during SNMP query: {str(e)}")
+                return {"error": f"Failed to execute SNMP query: {str(e)}"}
 
             logger.info(f"SNMP query completed successfully")
             return result
 
-        except SnmpError as e:
-            logger.error(f"SNMP error: {e}")
-            return {"error": f"SNMP error: {str(e)}"}
         except Exception as e:
-            logger.error(f"Error executing SNMP query: {e}")
+            logger.error(f"Error executing SNMP query: {e}", exc_info=True)
             return {"error": f"Error executing SNMP query: {str(e)}"}
 
     def _prepare_oids(self, operation: SNMPOperation) -> List[str]:
@@ -114,22 +128,33 @@ class SNMPService:
         result = {}
 
         try:
-            # Execute the gets in parallel for multiple OIDs
-            tasks = []
+            # Execute a GET for each OID
             for oid in oids:
-                tasks.append(client.get(ObjectIdentifier(oid)))
-
-            # Await all get operations
-            values = await asyncio.gather(*tasks)
-
-            # Map results back to OIDs
-            for i, oid in enumerate(oids):
-                name_str = self.mib_service.translate_oid(f".{oid}") or oid
-                result[name_str] = self._format_value(values[i])
+                try:
+                    value = await client.get(ObjectIdentifier(oid))
+                    name_str = self.mib_service.translate_oid(oid) or oid
+                    result[name_str] = self._format_value(value)
+                except SnmpError as e:
+                    # Handle all SNMP errors generically since the specific error classes don't exist
+                    error_msg = str(e)
+                    if "no such object" in error_msg.lower():
+                        logger.warning(f"No such object: {oid}")
+                        result[oid] = "No such object"
+                    elif "no such instance" in error_msg.lower():
+                        logger.warning(f"No such instance: {oid}")
+                        result[oid] = "No such instance"
+                    else:
+                        logger.error(f"Error getting OID {oid}: {e}")
+                        result[oid] = f"Error: {str(e)}"
+                except Exception as e:
+                    logger.error(f"Error getting OID {oid}: {e}")
+                    result[oid] = f"Error: {str(e)}"
 
         except Exception as e:
             logger.error(f"Error in GET: {e}")
-            result["error"] = str(e)
+            if not result:
+                # Only set error if we haven't got any results
+                result["error"] = str(e)
 
         return result
 
@@ -138,16 +163,21 @@ class SNMPService:
         result = {}
 
         try:
-            # Execute getnext for each OID
+            # Execute a GETNEXT for each OID
             for oid in oids:
-                next_results = await client.getnext(ObjectIdentifier(oid))
-                for next_oid, value in next_results.items():
+                try:
+                    next_oid, value = await client.getnext(ObjectIdentifier(oid))
                     name_str = self.mib_service.translate_oid(f".{next_oid}") or str(next_oid)
                     result[name_str] = self._format_value(value)
+                except Exception as e:
+                    logger.error(f"Error with GETNEXT for OID {oid}: {e}")
+                    result[oid] = f"Error: {str(e)}"
 
         except Exception as e:
             logger.error(f"Error in GETNEXT: {e}")
-            result["error"] = str(e)
+            if not result:
+                # Only set error if we haven't got any results
+                result["error"] = str(e)
 
         return result
 
@@ -158,17 +188,23 @@ class SNMPService:
         try:
             # Execute walk for each OID
             for oid in oids:
-                # client.walk returns an async generator that we need to iterate through
-                walk_gen = client.walk(ObjectIdentifier(oid))
+                try:
+                    # client.walk returns an async generator that we need to iterate through
+                    walk_gen = client.walk(ObjectIdentifier(oid))
 
-                # Process results from the generator
-                async for walked_oid, value in walk_gen:
-                    name_str = self.mib_service.translate_oid(f".{walked_oid}") or str(walked_oid)
-                    result[name_str] = self._format_value(value)
+                    # Process results from the generator
+                    async for walked_oid, value in walk_gen:
+                        name_str = self.mib_service.translate_oid(f".{walked_oid}") or str(walked_oid)
+                        result[name_str] = self._format_value(value)
+                except Exception as e:
+                    logger.error(f"Error with WALK for OID {oid}: {e}")
+                    result[f"{oid}_error"] = f"Error: {str(e)}"
 
         except Exception as e:
             logger.error(f"Error in WALK: {e}")
-            result["error"] = str(e)
+            if not result:
+                # Only set error if we haven't got any results
+                result["error"] = str(e)
 
         return result
 
