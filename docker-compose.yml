@@ -1,0 +1,13 @@
+version: '3'
+
+services:
+  snmp-ai:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./mibs:/app/mibs
+      - ./logs:/app/logs
+    env_file:
+      - .env
+    restart: unless-stopped

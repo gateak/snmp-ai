@@ -1,42 +1,23 @@
-FROM golang:1.21-alpine AS builder
+FROM python:3.9-slim
 
 WORKDIR /app
 
-# Install necessary build tools
-RUN apk add --no-cache git
+# Copy requirements first for better caching
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy go.mod and go.sum
-COPY go.mod ./
-
-# Download dependencies
-RUN go mod download
-
-# Copy source code
+# Copy the rest of the application
 COPY . .
 
-# Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -o snmp-ai ./cmd/server
+# Create MIB directory
+RUN mkdir -p mibs
 
-# Use a smaller image for the final stage
-FROM alpine:latest
-
-WORKDIR /app
-
-# Install necessary runtime dependencies
-RUN apk add --no-cache ca-certificates tzdata
-
-# Copy the binary from the builder stage
-COPY --from=builder /app/snmp-ai /app/
-COPY --from=builder /app/configs /app/configs
-
-# Create directory for MIBs
-RUN mkdir -p /app/configs/mibs
+# Expose the port
+EXPOSE 8000
 
 # Set environment variables
-ENV TZ=UTC
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
 
-# Expose API port
-EXPOSE 8080
-
-# Run the application
-CMD ["/app/snmp-ai"]
+# Command to run the API server
+CMD ["python", "main.py", "api", "--host", "0.0.0.0"]
